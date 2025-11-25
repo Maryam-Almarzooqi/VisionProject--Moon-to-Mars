@@ -1,0 +1,821 @@
+# train_RGB.py - LuSeg implementation for MSL images (FINAL CORRECTED VERSION)
+#
+# Purpose:
+#    This script implements the LuSeg segmentation model in PyTorch using a ResNet50 backbone
+#    for MSL (Mars Science Laboratory) RGB images. Key corrections include proper ImageNet
+#    standardization and robust PyTorch implementations for custom losses and metrics.
+#
+# Key Features:
+#   - Memory-efficient loading using a custom PyTorch Dataset (loads data on-demand).
+#   - ImageNet standardization for leveraging pre-trained weights.
+#   - Rare-class-aware augmentation strategy.
+#   - Hybrid Focal + Dice Loss optimized for segmentation imbalance.
+#   - Multi-class metrics (mIoU, mDice) calculated correctly, excluding the 'No Label' class.
+#   - Comprehensive training loop with early stopping and checkpointing.
+
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split 
+import matplotlib.colors as mcolors
+import torchvision.models as models
+
+# Import LuSeg model definition (Expected to be an UNet-like structure with ResNet50 encoder)
+from LuSeg import LuSeg_RGB as LuSeg
+
+# ============================================================================ 
+# CONFIGURATION
+# ============================================================================ 
+MODEL_NAME = "LuSeg_RGB_MSL_MCAM_ResNet50" # Identifier for checkpoints and plots
+
+# --- CHANGE THIS PATH ---
+DATA_DIR = "C:\\Users\\User\\Downloads\\msl\\mcam" # Base data directory
+# ------------------------
+IMG_DIR = os.path.join(DATA_DIR, "images")
+MASK_DIR = os.path.join(DATA_DIR, "labels\\train")
+
+IMG_HEIGHT, IMG_WIDTH = 256, 256 # Target input resolution
+CHANNELS = 3 # RGB input channels
+CLASS_NAMES = ['Soil', 'Bedrock', 'Sand', 'Big Rock', 'No Label']  # MSL terrain classes
+NUM_CLASSES = len(CLASS_NAMES) # Total classes, including 'No Label'
+
+RARE_CLASS_THRESHOLD = 0.05 # Threshold for defining a rare class based on pixel frequency
+FOCAL_ALPHA = 0.25 # Weighting parameter for Focal Loss
+FOCAL_GAMMA = 2.0 # Modulating factor for Focal Loss (down-weights easy examples)
+
+# ImageNet Mean and Std for ResNet50 Pre-training (crucial for transfer learning)
+# Applied to normalized [0, 1] RGB data.
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+# Model Hyperparameters
+BATCH_SIZE = 16
+LEARNING_RATE = 1e-4
+EPOCHS = 150 # Maximum epochs to run
+PATIENCE = 20 # Early stopping patience: epochs to wait for val_loss improvement
+OPTIMIZER_NAME = "Adam"
+LOSS_FUNCTION_NAME = "Hybrid Focal Dice Loss"
+LOSS_FUNCTION_COMPONENTS = ["Focal Loss", "Dice Loss"]
+
+# ============================================================================ 
+# SECTION 1: DATA INGESTION & 3-WAY SPLIT
+# ============================================================================ 
+print("="*60)
+print("SECTION 1: DATA INGESTION & 3-WAY SPLIT")
+print("="*60)
+
+def find_num_classes(mask_dir):
+    """Inspects sample masks to confirm the number of classes, especially the 'No Label' class (raw value 255)."""
+    mask_files = sorted(os.listdir(mask_dir))
+    all_values = set()
+    sample_files = mask_files[:min(50, len(mask_files))] 
+    for mask_file in sample_files:
+        mask = cv2.imread(os.path.join(mask_dir, mask_file), cv2.IMREAD_GRAYSCALE)
+        if mask is not None: 
+            all_values.update(np.unique(mask))
+    
+    num_classes = 5 # Fixed based on the MSL dataset specification (0, 1, 2, 3, 255)
+    print(f"Unique raw mask values found in sample: {sorted(all_values)}")
+    print(f"NUM_CLASSES set to: {num_classes}")
+    return num_classes
+
+NUM_CLASSES = find_num_classes(MASK_DIR)
+# Adjust CLASS_NAMES list if the detected class count differs (safety check)
+if NUM_CLASSES < len(CLASS_NAMES):
+    CLASS_NAMES = CLASS_NAMES[:NUM_CLASSES]
+elif NUM_CLASSES > len(CLASS_NAMES):
+    while len(CLASS_NAMES) < NUM_CLASSES:
+        CLASS_NAMES.append(f"Class {len(CLASS_NAMES)}")
+
+def get_file_lists(img_dir, mask_dir):
+    """Get lists of file paths. PyTorch Dataset will load images/masks on demand."""
+    img_files = sorted(os.listdir(img_dir))
+    mask_files = sorted(os.listdir(mask_dir))
+    
+    # Create absolute paths
+    img_paths = [os.path.join(img_dir, f) for f in img_files]
+    mask_paths = [os.path.join(mask_dir, f) for f in mask_files]
+    
+    print(f"Found {len(img_files)} image files")
+    print(f"Found {len(mask_files)} mask files")
+    
+    return img_paths, mask_paths
+
+print("\n--- Loading MSL MCAM Data Paths ---")
+img_paths, mask_paths = get_file_lists(IMG_DIR, MASK_DIR)
+
+# Split data paths into train (70%), validation (15%), and test (15%)
+# First split: 85% train/val, 15% test
+img_train_val, img_test, mask_train_val, mask_test = train_test_split(
+    img_paths, mask_paths, test_size=0.15, random_state=42
+)
+# Second split: 85% * 0.1765 ~ 15% for validation (0.15 / 0.85 ~ 0.1765)
+img_train, img_val, mask_train, mask_val = train_test_split(
+    img_train_val, mask_train_val, test_size=0.1765, random_state=42 
+)
+
+N_TRAIN = len(img_train)
+N_VALIDATION = len(img_val)
+N_TEST = len(img_test)
+
+print(f"\nDataset sizes:")
+print(f"  Training set (N_TRAIN): {N_TRAIN} samples")
+print(f"  Validation set (N_VALIDATION): {N_VALIDATION} samples")
+print(f"  Test set (N_TEST): {N_TEST} samples")
+
+# ============================================================================
+# SECTION 2: RARE CLASS IDENTIFICATION
+# ============================================================================
+print("\n" + "="*60)
+print("SECTION 2: RARE CLASS IDENTIFICATION")
+print("="*60)
+
+def identify_rare_classes_from_sample(mask_paths, sample_size=500):
+    """
+    Estimates pixel frequency for each class using a random subset of training masks.
+    Classes below RARE_CLASS_THRESHOLD are flagged for preferential augmentation.
+    """
+    sample_paths = np.random.choice(mask_paths, min(sample_size, len(mask_paths)), replace=False)
+    
+    all_pixels = []
+    print(f"Sampling {len(sample_paths)} masks for class distribution...")
+    
+    for i, mask_path in enumerate(sample_paths):
+        if i % 100 == 0:
+            print(f"  Processing {i}/{len(sample_paths)}...")
+        
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is not None:
+            # Masks must be resized using nearest neighbor to preserve boundaries/classes
+            mask = cv2.resize(mask, (IMG_WIDTH, IMG_HEIGHT), interpolation=cv2.INTER_NEAREST)
+            if NUM_CLASSES == 5:
+                # Remap raw 255 (No Label) to the final class index (4)
+                mask[mask == 255] = NUM_CLASSES - 1
+            mask = np.clip(mask, 0, NUM_CLASSES - 1)
+            all_pixels.extend(mask.flatten())
+    
+    all_pixels = np.array(all_pixels)
+    # Count pixel occurrences for each class
+    class_counts = np.bincount(all_pixels, minlength=NUM_CLASSES)
+    class_frequencies = class_counts / len(all_pixels)
+    
+    print("\nClass Distribution (Training Sample):")
+    for i, (count, freq) in enumerate(zip(class_counts, class_frequencies)):
+        print(f"  Class {i} ({CLASS_NAMES[i]}): {count:,} pixels ({freq*100:.2f}%)")
+    
+    # Identify rare classes
+    rare_classes = {i for i, freq in enumerate(class_frequencies) if freq < RARE_CLASS_THRESHOLD}
+    print(f"\nRare Classes (< {RARE_CLASS_THRESHOLD*100:.1f}% frequency): {rare_classes}")
+    
+    return rare_classes
+
+RARE_CLASSES = identify_rare_classes_from_sample(mask_train)
+
+# ============================================================================
+# SECTION 3: DATA AUGMENTATION (Rare Class Aware)
+# ============================================================================
+print("\n" + "="*60)
+print("SECTION 3: DATA AUGMENTATION (Rare Class Aware)")
+print("="*60)
+
+class MSLDataset(Dataset):
+    """
+    Custom PyTorch Dataset class.
+    Loads and preprocesses images/masks on the fly, saving RAM.
+    Implements ImageNet standardization and rare-class augmentation.
+    """
+    
+    def __init__(self, img_paths, mask_paths, rare_classes, augment=True):
+        self.img_paths = img_paths
+        self.mask_paths = mask_paths
+        self.rare_classes = rare_classes
+        self.augment = augment
+    
+    def __len__(self):
+        return len(self.img_paths)
+    
+    def __getitem__(self, idx):
+        # 1. Load and initial preprocess image (H, W, C)
+        img = cv2.imread(self.img_paths[idx])
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # BGR to RGB
+        img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
+        img = img / 255.0 # Normalize to [0, 1]
+        img = img.astype(np.float32)
+        
+        # 2. ImageNet Standardization (CRUCIAL for ResNet pre-trained weights)
+        img = (img - IMAGENET_MEAN) / IMAGENET_STD
+        
+        # 3. Load and preprocess mask (H, W, 1)
+        mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+        mask = cv2.resize(mask, (IMG_WIDTH, IMG_HEIGHT), interpolation=cv2.INTER_NEAREST)
+        if NUM_CLASSES == 5:
+            # Map raw 255 (No Label) to the last class index (4)
+            mask[mask == 255] = NUM_CLASSES - 1
+        mask = np.clip(mask, 0, NUM_CLASSES - 1)
+        
+        # 4. Check if image contains rare class
+        has_rare = np.any(np.isin(mask, list(self.rare_classes)))
+        
+        # 5. Augmentation
+        if self.augment:
+            img, mask = self._augment(img, mask, has_rare)
+        
+        # 6. Convert to PyTorch tensors
+        # PyTorch requires C x H x W format for images
+        img = torch.from_numpy(img).permute(2, 0, 1).float()
+        # Mask remains H x W (long integer indices)
+        mask = torch.from_numpy(mask).long()
+        
+        return img, mask
+    
+    def _augment(self, img, mask, has_rare):
+        """Applies augmentation with weighted probability."""
+        augment_prob = 0.7 if has_rare else 0.3 # Higher prob for rare-class images
+        
+        if np.random.rand() < augment_prob:
+            # Geometric transformations (applied to both image and mask)
+            if np.random.rand() > 0.5: # Horizontal flip
+                img = np.fliplr(img).copy()
+                mask = np.fliplr(mask).copy()
+            if np.random.rand() > 0.5: # Vertical flip
+                img = np.flipud(img).copy()
+                mask = np.flipud(mask).copy()
+            if np.random.rand() > 0.5: # Rotation (90, 180, 270 degrees)
+                k = np.random.randint(1, 4)
+                img = np.rot90(img, k).copy()
+                mask = np.rot90(mask, k).copy()
+            # Color augmentation (applied only to image, after standardization)
+            if np.random.rand() > 0.5:
+                factor = np.random.uniform(0.85, 1.15)
+                # Caution: Applying factor to standardized data changes the mean/std
+                img = np.clip(img * factor, -10, 10) # Clip bounds are relaxed for standardized data
+        return img, mask
+
+print("Rare class-aware data generator created.")
+
+# Create datasets
+train_dataset = MSLDataset(img_train, mask_train, RARE_CLASSES, augment=True)
+val_dataset = MSLDataset(img_val, mask_val, set(), augment=False) # No augmentation for validation
+test_dataset = MSLDataset(img_test, mask_test, set(), augment=False)
+
+# Create dataloaders (responsible for batching and shuffling)
+# num_workers=0 is typically used for debugging on small systems
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+
+print(f"Training batches per epoch: {len(train_loader)}")
+print(f"Validation batches per epoch: {len(val_loader)}")
+print(f"Test batches: {len(test_loader)}")
+
+# ============================================================================
+# SECTION 4: LUSEG MODEL (RGB-ONLY)
+# ============================================================================
+print("\n" + "="*60)
+print("SECTION 4: LUSEG MODEL (RGB-ONLY)")
+print("="*60)
+
+# Configure device (GPU or CPU)
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+print("\n--- Building LuSeg Model ---")
+# LuSeg_RGB initializes the ResNet-50 encoder with ImageNet weights by default
+model = LuSeg(n_class=NUM_CLASSES)
+model = model.to(device)
+
+# Parameter calculation
+print(f"\nModel Summary:")
+print(f" Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+print(f" Input shape: (batch, {CHANNELS}, {IMG_HEIGHT}, {IMG_WIDTH})")
+print(f" Output shape: (batch, {NUM_CLASSES}, {IMG_HEIGHT}, {IMG_WIDTH})")
+
+# ============================================================================
+# SECTION 5: PERFORMANCE METRICS & CUSTOM LOSS FUNCTIONS
+# ============================================================================
+print("\n" + "="*60)
+print("SECTION 5: PERFORMANCE METRICS & CUSTOM LOSS FUNCTIONS")
+print("="*60)
+
+# --- Metric Functions (Excluding 'No Label' class) ---
+
+def iou_metric_batch(y_pred, y_true, num_classes, smooth=1e-6):
+    """
+    Calculates Mean IoU (mIoU) for a batch.
+    NOTE: Calculates IoU for all classes and then takes the mean, excluding the last class ('No Label').
+    y_pred: (B, C, H, W) logits
+    y_true: (B, H, W) class indices
+    """
+    # Convert logits to class predictions (B, H, W)
+    y_pred_class = torch.argmax(y_pred, dim=1)
+    
+    # Convert to one-hot encoding (B, C, H, W)
+    y_pred_oh = F.one_hot(y_pred_class, num_classes=num_classes).permute(0, 3, 1, 2)
+    y_true_oh = F.one_hot(y_true, num_classes=num_classes).permute(0, 3, 1, 2)
+
+    # Calculate intersection and union aggregated over the batch and spatial dimensions
+    intersection = (y_pred_oh * y_true_oh).sum(dim=(0, 2, 3)) # (C)
+    union = (y_pred_oh + y_true_oh).sum(dim=(0, 2, 3)) - intersection # (C)
+    
+    # IoU per class (C)
+    iou_per_class = (intersection + smooth) / (union + smooth)
+
+    # Calculate Mean IoU, excluding the 'No Label' class (index NUM_CLASSES - 1)
+    miou = iou_per_class[:num_classes - 1].mean()
+    
+    return miou.item()
+
+def dice_coefficient_batch(y_pred, y_true, num_classes, smooth=1e-6):
+    """
+    Calculates Mean Dice Coefficient (mDice) for a batch.
+    NOTE: Excludes the last class ('No Label') from the mean calculation.
+    y_pred: (B, C, H, W) logits
+    y_true: (B, H, W) class indices
+    """
+    y_pred_class = torch.argmax(y_pred, dim=1)
+    
+    y_pred_oh = F.one_hot(y_pred_class, num_classes=num_classes).permute(0, 3, 1, 2)
+    y_true_oh = F.one_hot(y_true, num_classes=num_classes).permute(0, 3, 1, 2)
+
+    # Intersection: (C)
+    intersection = (y_pred_oh * y_true_oh).sum(dim=(0, 2, 3))
+    # Denominator of Dice:  |A| + |B|
+    den = y_pred_oh.sum(dim=(0, 2, 3)) + y_true_oh.sum(dim=(0, 2, 3))
+    
+    dice_per_class = (2. * intersection + smooth) / (den + smooth)
+    
+    # Calculate Mean Dice, excluding the 'No Label' class
+    mdice = dice_per_class[:num_classes - 1].mean()
+
+    return mdice.item()
+
+
+# --- Loss Functions ---
+
+def DiceLoss(y_pred, y_true, num_classes, smooth=1e-6):
+    """
+    Differentiable Mean Dice Loss for multi-class segmentation.
+    Computes the mean of (1 - Dice Coefficient) over the relevant classes.
+    """
+    
+    # Ground truth one-hot (B, C, H, W)
+    y_true_oh = F.one_hot(y_true, num_classes=num_classes).permute(0, 3, 1, 2).float() 
+    
+    # Predicted probabilities from logits (B, C, H, W)
+    y_pred_prob = F.softmax(y_pred, dim=1)
+    
+    # Flatten across spatial dimensions to (B*H*W, C)
+    # .contiguous() is essential before .view() to ensure memory layout is correct
+    y_pred_flat = y_pred_prob.contiguous().view(-1, num_classes)
+    y_true_flat = y_true_oh.contiguous().view(-1, num_classes)
+    
+    # Calculate intersection and denominator for all classes (C)
+    intersection = (y_pred_flat * y_true_flat).sum(dim=0)
+    den = y_pred_flat.sum(dim=0) + y_true_flat.sum(dim=0)
+    
+    # Dice Coefficient per class: (C)
+    dice_per_class = (2. * intersection + smooth) / (den + smooth)
+    
+    # Mean Dice Loss (1 - mean of Dice Coeff), excluding the 'No Label' class
+    mdice_loss = 1.0 - dice_per_class[:num_classes - 1].mean()
+
+    return mdice_loss
+
+def FocalLoss(y_pred, y_true, num_classes, gamma=FOCAL_GAMMA, alpha=FOCAL_ALPHA):
+    """
+    Categorical Focal Loss implementation.
+    Addresses class imbalance by down-weighting loss contributions from easy examples.
+    """
+    
+    y_true_onehot = F.one_hot(y_true, num_classes=num_classes).permute(0, 3, 1, 2).float() # (B, C, H, W)
+    
+    # Use log_softmax for numerical stability
+    log_softmax = F.log_softmax(y_pred, dim=1)
+    p_t = torch.exp(log_softmax) # Probability of the true class
+    
+    # Standard Cross Entropy contribution
+    cross_entropy = -y_true_onehot * log_softmax 
+    
+    # Modulating factor: (1 - p_t)^gamma
+    modulating_factor = torch.pow(1.0 - p_t, gamma)
+    
+    # Alpha factor: weights positive vs negative examples
+    alpha_factor = y_true_onehot * alpha + (1 - y_true_onehot) * (1 - alpha)
+    focal_loss = alpha_factor * modulating_factor * cross_entropy
+    
+    # Return the mean loss across the batch and spatial dimensions
+    return torch.mean(torch.sum(focal_loss, dim=1))
+
+def HybridFocalDiceLoss(y_pred, y_true, num_classes, focal_weight=0.5, dice_weight=0.5):
+    """Hybrid Focal Dice Loss: Weighted sum of Focal Loss and Dice Loss (BCE component missing)."""
+    focal_l = FocalLoss(y_pred, y_true, num_classes)
+    dice_l = DiceLoss(y_pred, y_true, num_classes)
+    return focal_weight * focal_l + dice_weight * dice_l
+
+# Optimizer initialization
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+print(f"\n--- Compiling Model with {LOSS_FUNCTION_NAME} ---")
+print(f"Model compiled with {LOSS_FUNCTION_NAME} and requested metrics for multi-class output")
+print("Note: Metrics (mIoU, mDice) now exclude the 'No Label' class (index 4) as per standard practice.")
+
+# ============================================================================
+# SECTION 6: TRAINING
+# ============================================================================
+print("\n" + "="*60)
+print("SECTION 6: TRAINING")
+print("="*60)
+
+# Initialize history dictionary to track metrics across epochs
+history = {
+    'loss': [],
+    'val_loss': [],
+    'accuracy': [],
+    'val_accuracy': [],
+    'dice_coefficient': [],
+    'val_dice_coefficient': [],
+    'mean_iou': [],   # Mean IoU (mIoU) excluding 'No Label'
+    'val_mean_iou': [] # Validation mIoU
+}
+
+best_val_loss = float('inf')
+patience_counter = 0
+best_epoch = 0
+
+print("\n--- Starting Training ---")
+for epoch in range(EPOCHS):
+    print(f"Epoch {epoch+1}/{EPOCHS}")
+    
+    # --- TRAINING PHASE ---
+    model.train()
+    train_loss = 0.0
+    train_correct = 0
+    train_total = 0
+    train_dice = 0.0
+    train_iou = 0.0
+    
+    for batch_idx, (images, masks) in enumerate(train_loader):
+        images = images.to(device)
+        masks = masks.to(device)
+        
+        # Forward pass (outputs are logits: B, C, H, W)
+        rgb_en_out, outputs = model(images)
+        
+        # Compute hybrid loss
+        loss = HybridFocalDiceLoss(outputs, masks, num_classes=NUM_CLASSES)
+        
+        # Backward pass and optimization step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # --- Metric Accumulation ---
+        train_loss += loss.item()
+        
+        # Pixel Accuracy (Global Accuracy over all pixels/classes)
+        _, predicted = torch.max(outputs.data, 1) # (B, H, W)
+        batch_total = masks.numel() # Total number of pixels
+        batch_correct = (predicted == masks).sum().item()
+        train_total += batch_total
+        train_correct += batch_correct
+        
+        # Multi-class metrics (calculated without gradient tracking)
+        with torch.no_grad():
+            batch_dice = dice_coefficient_batch(outputs, masks, num_classes=NUM_CLASSES)
+            batch_iou = iou_metric_batch(outputs, masks, num_classes=NUM_CLASSES)
+            train_dice += batch_dice
+            train_iou += batch_iou
+        
+        # Print running averages for the batch
+        avg_loss = train_loss / (batch_idx + 1)
+        avg_acc = train_correct / train_total
+        avg_dice = train_dice / (batch_idx + 1)
+        avg_iou = train_iou / (batch_idx + 1)
+        
+        print(f"  {batch_idx+1}/{len(train_loader)} - "
+            f"loss: {avg_loss:.4f} - accuracy: {avg_acc:.4f} - "
+            f"dice_coefficient: {avg_dice:.4f} - mean_iou: {avg_iou:.4f}", end='\r')
+    
+    avg_train_loss = train_loss / len(train_loader)
+    train_accuracy = train_correct / train_total
+    avg_train_dice = train_dice / len(train_loader)
+    avg_train_iou = train_iou / len(train_loader)
+    
+    # --- VALIDATION PHASE ---
+    model.eval() # Set model to evaluation mode (disables dropout, BN updates)
+    val_loss = 0.0
+    val_correct = 0
+    val_total = 0
+    val_dice = 0.0
+    val_iou = 0.0
+    
+    with torch.no_grad():
+        for images, masks in val_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            rgb_en_out, outputs = model(images)
+            loss = HybridFocalDiceLoss(outputs, masks, num_classes=NUM_CLASSES)
+            
+            _, predicted = torch.max(outputs.data, 1)
+            val_total += masks.numel()
+            val_correct += (predicted == masks).sum().item()
+            val_loss += loss.item()
+            
+            val_dice += dice_coefficient_batch(outputs, masks, num_classes=NUM_CLASSES)
+            val_iou += iou_metric_batch(outputs, masks, num_classes=NUM_CLASSES)
+    
+    avg_val_loss = val_loss / len(val_loader)
+    val_accuracy = val_correct / val_total
+    avg_val_dice = val_dice / len(val_loader)
+    avg_val_iou = val_iou / len(val_loader)
+    
+    # --- History Logging ---
+    history['loss'].append(avg_train_loss)
+    history['val_loss'].append(avg_val_loss)
+    history['accuracy'].append(train_accuracy)
+    history['val_accuracy'].append(val_accuracy)
+    history['dice_coefficient'].append(avg_train_dice)
+    history['val_dice_coefficient'].append(avg_val_dice)
+    history['mean_iou'].append(avg_train_iou)
+    history['val_mean_iou'].append(avg_val_iou)
+    
+    # Print full epoch summary
+    print(f"TRAIN/VAL Epoch Summary: "
+        f"loss: {avg_train_loss:.4f} - acc: {train_accuracy:.4f} - "
+        f"mDice: {avg_train_dice:.4f} - mIoU: {avg_train_iou:.4f} || "
+        f"val_loss: {avg_val_loss:.4f} - val_acc: {val_accuracy:.4f} - "
+        f"val_mDice: {avg_val_dice:.4f} - val_mIoU: {avg_val_iou:.4f}")
+    
+    # --- Early Stopping & Checkpointing ---
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        best_epoch = epoch + 1
+        patience_counter = 0
+        # Save the model weights (state_dict) corresponding to the best validation loss
+        torch.save(model.state_dict(), f'{MODEL_NAME}_best.pth')
+        print(f'Epoch {epoch+1}: val_loss improved to {avg_val_loss:.5f}, saving model to {MODEL_NAME}_best.pth')
+    else:
+        patience_counter += 1
+        print(f'Epoch {epoch+1}: val_loss did not improve from {best_val_loss:.5f}. Patience: {patience_counter}/{PATIENCE}')
+        if patience_counter >= PATIENCE:
+            print(f'Restoring model weights from the best epoch: {best_epoch}.')
+            print(f'Epoch {epoch+1}: early stopping triggered.')
+            break
+
+print("\nTraining completed!")
+actual_epochs_run = len(history['loss'])
+
+# --- Determine Early Stopping Info ---
+# If patience was exceeded, the best epoch was PATIENCE steps back
+if patience_counter >= PATIENCE:
+    actual_epochs_run = epoch + 1
+    best_epoch = actual_epochs_run - PATIENCE
+else:
+    # If training ran to completion (EPOCHS), the last epoch is the best
+    actual_epochs_run = EPOCHS
+    best_epoch = EPOCHS
+
+# ============================================================================
+# FINAL RESULTS SUMMARY
+# ============================================================================
+print("\n" + "="*60)
+print(f"## Final Results Summary for {MODEL_NAME}")
+print("="*60)
+
+# --- 1. Hyperparameter Table ---
+print("\n### Hyperparameters and Configuration")
+print(f"| Parameter | Value |")
+print(f"| :--- | :--- |")
+print(f"| **Model Architecture** | LuSeg (RGB-only, ResNet-50) |")
+print(f"| **Image Size** | {IMG_HEIGHT}x{IMG_WIDTH} |")
+print(f"| **Optimizer** | {OPTIMIZER_NAME} |")
+print(f"| **Learning Rate** | {LEARNING_RATE} |")
+print(f"| **Loss Function** | {LOSS_FUNCTION_NAME} ({' + '.join(LOSS_FUNCTION_COMPONENTS)}) |")
+print(f"| **Batch Size** | {BATCH_SIZE} |")
+print(f"| **Max Epochs** | {EPOCHS} |")
+print(f"| **Early Stopping Patience** | {PATIENCE} (Monitor: val_loss) |")
+print(f"| **Normalization** | ImageNet Mean/Std (Crucial) |")
+
+# --- 2. Training & Stopping Info ---
+print("\n### Trial Summary")
+print(f"* **Model Name:** {MODEL_NAME}")
+print(f"* **Max Epochs:** {EPOCHS}")
+print(f"* **Actual Epochs Run:** {actual_epochs_run}")
+print(f"* **Early Stopping Occurred at:** Epoch {actual_epochs_run if patience_counter >= PATIENCE else 'None'} (Best Model from Epoch {best_epoch})")
+print(f"* **Best Weights Restored From:** Epoch {best_epoch}")
+
+print("\n### Data and Masks Identified (MSL MCAM / AI4Mars)")
+print(f"* **Training Images (N_TRAIN):** {N_TRAIN}")
+print(f"* **Validation Images (N_VALIDATION):** {N_VALIDATION}")
+print(f"* **Testing Images (N_TEST):** {N_TEST}")
+print(f"* **Number of Masks Identified (NUM_CLASSES):** {NUM_CLASSES}")
+print(f"* **MSL Terrain Classes:** {', '.join(CLASS_NAMES)}")
+print(f"> *Reference: Masks refer to semantic segmentation for Mars rover traversability, classifying the terrain into {NUM_CLASSES-1} types (Soil, Bedrock, Sand, Big Rock) plus a null/no-label category for masked-out regions.*")
+
+# --- 3. Results Per Epoch ---
+print("\n### Summary of All Epoch Trials")
+metrics_to_show = ['loss', 'val_loss', 'accuracy', 'val_accuracy', 'dice_coefficient', 'val_dice_coefficient', 'mean_iou', 'val_mean_iou']
+
+WIDTH = 12
+header_names = ['loss', 'val_loss', 'accuracy', 'val_accuracy', 'dice_coeffic', 'val_dice_coe', 'mean_iou', 'val_mean_iou']
+header = "Epoch | " + " | ".join(f"{name:^{WIDTH}.{WIDTH}}" for name in header_names)
+
+print("-" * (len(header) + 4))
+print(header)
+print("-" * (len(header) + 4))
+
+for epoch in range(len(history['loss'])):
+    # Mark the best epoch
+    best_epoch_flag = "*" if (epoch + 1 == best_epoch) else " "
+    
+    values = [f"{history[m][epoch]:^{WIDTH}.4f}" for m in metrics_to_show]
+    print(f"{epoch + 1:^5}{best_epoch_flag}| " + " | ".join(values))
+print("-" * (len(header) + 4))
+
+# --- 4. Final Test Evaluation ---
+print("\n### Final Test Results (Best Model)")
+# Load the best model weights saved during training
+model.load_state_dict(torch.load(f'{MODEL_NAME}_best.pth'))
+model.eval()
+
+test_loss = 0.0
+test_correct = 0
+test_total = 0
+test_dice = 0.0
+test_iou = 0.0
+
+with torch.no_grad():
+    for images, masks in test_loader:
+        images = images.to(device)
+        masks = masks.to(device)
+        
+        rgb_en_out, outputs = model(images)
+        loss = HybridFocalDiceLoss(outputs, masks, num_classes=NUM_CLASSES)
+        
+        _, predicted = torch.max(outputs.data, 1)
+        test_total += masks.numel()
+        test_correct += (predicted == masks).sum().item()
+        test_loss += loss.item()
+        
+        test_dice += dice_coefficient_batch(outputs, masks, num_classes=NUM_CLASSES)
+        test_iou += iou_metric_batch(outputs, masks, num_classes=NUM_CLASSES)
+
+test_loss = test_loss / len(test_loader)
+test_accuracy = test_correct / test_total
+test_dice = test_dice / len(test_loader)
+test_iou = test_iou / len(test_loader)
+
+metric_names = ['Loss', 'Accuracy', 'Dice Coefficient (mDice)', 'Mean IoU Metric (mIoU)']
+results = [test_loss, test_accuracy, test_dice, test_iou]
+
+for name, result in zip(metric_names, results):
+    print(f"Test {name:<30}: {result:.4f}")
+
+print("\n---")
+
+# ============================================================================
+# SECTION 7: VISUALIZATION - GRAPHS
+# ============================================================================
+print("\n" + "="*60)
+print("## VISUALIZATION - TRAINING GRAPHS")
+print("="*60)
+
+plt.figure(figsize=(20, 5))
+
+# Loss Plot
+plt.subplot(1, 4, 1)
+plt.plot(history['loss'], label=f'Train {LOSS_FUNCTION_NAME}')
+plt.plot(history['val_loss'], label=f'Validation {LOSS_FUNCTION_NAME}') 
+plt.title(f'Loss vs. Epochs ({MODEL_NAME})')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+
+# Accuracy Plot
+plt.subplot(1, 4, 2)
+plt.plot(history['accuracy'], label='Train Accuracy')
+plt.plot(history['val_accuracy'], label='Validation Accuracy') 
+plt.title(f'Accuracy vs. Epochs ({MODEL_NAME})')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy (Global)')
+plt.legend()
+plt.grid(True)
+
+# Dice Coefficient Plot
+plt.subplot(1, 4, 3)
+plt.plot(history['dice_coefficient'], label='Train Dice Coeff (mDice)')
+plt.plot(history['val_dice_coefficient'], label='Validation Dice Coeff (mDice)') 
+plt.title(f'Dice Coefficient vs. Epochs ({MODEL_NAME})')
+plt.xlabel('Epochs')
+plt.ylabel('Mean Dice Coefficient (w/o "No Label")')
+plt.legend()
+plt.grid(True)
+
+# IoU Plot
+plt.subplot(1, 4, 4)
+plt.plot(history['mean_iou'], label='Train IoU (mIoU)')
+plt.plot(history['val_mean_iou'], label='Validation IoU (mIoU)')
+plt.title(f'Mean IoU vs. Epochs ({MODEL_NAME})')
+plt.xlabel('Epochs')
+plt.ylabel('Mean IoU (w/o "No Label")')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+PLOT_FILENAME = f'training_history_{MODEL_NAME}.png'
+plt.savefig(PLOT_FILENAME, dpi=300, bbox_inches='tight')
+print(f"\nTraining plots for {MODEL_NAME} saved as '{PLOT_FILENAME}' ")
+plt.show()
+
+print("\n---")
+
+# ============================================================================
+# SECTION 8: VISUALIZATION - IMAGE PREDICTIONS
+# ============================================================================
+print("\n" + "="*60)
+print("## VISUALIZATION - IMAGE PREDICTIONS")
+print("="*60)
+
+# Setup colormap for mask visualization
+cmap = plt.cm.get_cmap('jet', NUM_CLASSES)
+norm = mcolors.BoundaryNorm(np.arange(-0.5, NUM_CLASSES, 1), cmap.N)
+
+# Select random test samples
+num_samples = min(5, len(test_dataset))
+indices = np.random.choice(len(test_dataset), num_samples, replace=False)
+
+# Create figure for input, prediction, and ground truth
+fig, axes = plt.subplots(num_samples, 3, figsize=(15, num_samples * 3 + 1), 
+                        gridspec_kw={'wspace': 0.05, 'hspace': 0.1}) 
+
+if num_samples == 1:
+    axes = np.expand_dims(axes, axis=0) # Ensure axes is 2D for consistent indexing
+    
+fig.suptitle(f'Sample Predictions on Test Data - Model: {MODEL_NAME}', fontsize=16, y=0.98)
+
+model.eval()
+with torch.no_grad():
+    for i, idx in enumerate(indices):
+        # Get preprocessed image tensor and true mask (H, W)
+        img_tensor, true_mask = test_dataset[idx]
+        
+        # Prepare for prediction (add batch dimension and move to device)
+        img_tensor = img_tensor.unsqueeze(0).to(device)
+        
+        # Predict (outputs are logits: 1, C, H, W)
+        rgb_en_out, pred_output = model(img_tensor)
+        # Get class index from logits
+        pred_mask = torch.argmax(pred_output, dim=1).cpu().numpy()[0]
+        
+        # Convert image for display (denormalize for visualization)
+        img_display = img_tensor.cpu().squeeze(0).permute(1, 2, 0).numpy() # C, H, W -> H, W, C
+        # Reverse ImageNet standardization
+        img_display = img_display * IMAGENET_STD + IMAGENET_MEAN
+        img_display = np.clip(img_display, 0, 1) # Clip back to valid display range
+
+        true_mask = true_mask.cpu().numpy()
+
+        # Plot Input Image
+        ax = axes[i, 0]
+        ax.imshow(img_display)
+        if i == 0: ax.set_title('Input Image (RGB)')
+        ax.axis('off')
+
+        # Plot Predicted Mask
+        ax = axes[i, 1]
+        im = ax.imshow(pred_mask, cmap=cmap, norm=norm)
+        if i == 0: ax.set_title('Predicted Mask')
+        ax.axis('off')
+
+        # Plot Ground Truth
+        ax = axes[i, 2]
+        ax.imshow(true_mask, cmap=cmap, norm=norm)
+        if i == 0: ax.set_title('Ground Truth Mask')
+        ax.axis('off')
+
+# Add Colorbar Legend
+cbar_ax = fig.add_axes([0.92, 0.1, 0.02, 0.8]) # Define position for the colorbar
+cbar = fig.colorbar(im, cax=cbar_ax, ticks=np.arange(NUM_CLASSES))
+cbar.set_label('Terrain Class Index')
+
+# Set labels for the colorbar ticks
+cbar.ax.set_yticks(np.arange(NUM_CLASSES), minor=False)
+cbar.ax.set_yticklabels(CLASS_NAMES)
+cbar.set_label("MSL Terrain Class", fontsize=12)
+
+plt.tight_layout(rect=[0, 0, 0.9, 0.95]) 
+PRED_FILENAME = f'predictions_on_test_set_{MODEL_NAME}.png'
+plt.savefig(PRED_FILENAME, dpi=300, bbox_inches='tight')
+print(f"Prediction samples for {MODEL_NAME} saved as '{PRED_FILENAME}' ")
+plt.show()
+
+print("\n" + "="*60)
+print("COMPLETE!")
+print("="*60)
