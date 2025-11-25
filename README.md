@@ -6,22 +6,34 @@ This repository contains state-of-the-art semantic segmentation models tailored 
 ## All the models have Common Features such as:
 
 Input: 256 x 256 RGB images from MSL MCAM.
+
 Output: Multi-class semantic segmentation mask.
+
 Class imbalance handled via rare-class-aware augmentation.
+
 Loss: Hybrid Focal Dice Loss combining boundary sensitivity (Focal) with overlap optimization (Dice).
 
 ## All of the codes are structured in the following Way:
 
 Imports and Setup
 Configuration (Hyperparameters & Dataset Paths)
+
 SECTION 1: Data Loading & Splitting
+
 SECTION 2: Identify Rare Classes
+
 SECTION 3: Data Augmentation (Rare-Class Aware)
+
 SECTION 4: Model Architecture
+
 SECTION 5: Loss Functions & Metrics
+
 SECTION 6: Training
+
 SECTION 7: Final Results Summary
+
 SECTION 8: Visualization – Training Graphs
+
 SECTION 9: Visualization – Image Predictions
 
 
