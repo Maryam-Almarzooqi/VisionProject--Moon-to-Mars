@@ -3,9 +3,9 @@
 This repository contains state-of-the-art semantic segmentation models tailored for Lunar Terrian detection (LuSeg) applied to Mars Science Laboratory (MSL) MCAM images. Each model is optimized to segment Martian terrain into multiple classes, including Soil, Bedrock, Sand, and Big Rock, addressing challenges like class imbalance with specialized augmentation and loss functions. The different models are explored to comapre their performance against an aritecture detecated to Lunar Terrian Detection and evlauting how it performs in Mars Terrian Detection.
 
 
-##All the models have Common Features such as:
+## All the models have Common Features such as:
 
-Input: $256 x 256 RGB images from MSL MCAM.
+Input: 256 x 256 RGB images from MSL MCAM.
 Output: Multi-class semantic segmentation mask.
 Class imbalance handled via rare-class-aware augmentation.
 Loss: Hybrid Focal Dice Loss combining boundary sensitivity (Focal) with overlap optimization (Dice).
