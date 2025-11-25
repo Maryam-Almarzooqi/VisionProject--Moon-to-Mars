@@ -1,0 +1,738 @@
+# Final VGG16-based U-Net implementation for MSL images
+#
+# Purpose:
+#   This script implements a U-Net style segmentation model with a **VGG16 encoder**,
+#   tailored for the MSL (Mars Science Laboratory) MCAM dataset. It includes:
+#     - data loading and preprocessing (images + grayscale mask handling)
+#     - a rare-class-aware augmentation pipeline
+#     - a U-Net decoder built on top of the VGG16 encoder/backbone
+#     - hybrid loss combining focal loss and dice loss (useful for class imbalance)
+#     - training loop with checkpointing and early stopping
+#     - evaluation and visualizations (training curves and sample predictions)
+#
+# Run instructions:
+#   - Set DATA_DIR to the folder that contains "images" and "labels/train".
+#   - Make sure you have TensorFlow and required Python packages installed.
+#   - Execute the script in an environment with GPU if available for faster training.
+
+import os
+import cv2
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+
+# Import VGG16 as the Encoder backbone
+from tensorflow.keras.applications import VGG16 
+from tensorflow.keras.layers import (Conv2D, concatenate, LeakyReLU, BatchNormalization, Dropout, UpSampling2D)
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import backend as K
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+import matplotlib.colors as mcolors
+
+# Set Keras backend image data format to channels_last (H, W, C)
+K.set_image_data_format('channels_last') 
+
+# --------------------------
+# CONFIGURATION
+# --------------------------
+# Model identifier for saving files and printing summaries
+MODEL_NAME = "VGG16_U-Net_MSL_MCAM"
+
+# Local dataset layout: images/ and labels/train/ directories expected
+DATA_DIR = "C:\\Users\\User\\Downloads\\msl\\mcam"
+IMG_DIR = os.path.join(DATA_DIR, "images")
+MASK_DIR = os.path.join(DATA_DIR, "labels\\train")
+
+# Input image shape used for training and model construction
+IMG_HEIGHT, IMG_WIDTH = 256, 256
+CHANNELS = 3 # RGB input
+# Semantic classes for the MSL terrain
+CLASS_NAMES = ['Soil', 'Bedrock', 'Sand', 'Big Rock', 'No Label'] 
+NUM_CLASSES = len(CLASS_NAMES) # Will be verified by mask inspection
+
+# Hyperparameters for Rare Class Augmentation and Loss Function
+RARE_CLASS_THRESHOLD = 0.05 # Classes with < 5% pixel frequency are 'rare'
+INITIAL_LR = 1e-4
+FOCAL_ALPHA = 0.25 # Alpha parameter for Focal Loss (weighting factor)
+FOCAL_GAMMA = 2.0  # Gamma parameter for Focal Loss (focusing parameter)
+
+# Model Training Hyperparameters
+DM_N_FILTERS = 32 # Base filter count (not strictly used in this VGG16 U-Net decoder)
+DM_INIT = 'he_normal'
+DM_LAMBDA = 1e-4
+DM_DROPOUT = 0.5
+BATCH_SIZE = 16
+LEARNING_RATE = INITIAL_LR
+EPOCHS = 50 
+PATIENCE = 20 # Early stopping patience
+OPTIMIZER_NAME = "Adam"
+LOSS_FUNCTION_NAME = "Hybrid Focal Dice Loss"
+LOSS_FUNCTION_COMPONENTS = ["Focal Loss", "Dice Loss"]
+
+# --------------------------
+# SECTION 1: DATA LOADING & SPLITTING
+# --------------------------
+print("="*60)
+print("SECTION 1: DATA INGESTION & 3-WAY SPLIT")
+print("="*60)
+
+def find_num_classes(mask_dir):
+    """
+    Inspect a small sample of mask files to check unique pixel values
+    and confirm the expected number of classes for this dataset (NUM_CLASSES=5).
+    """
+    mask_files = sorted(os.listdir(mask_dir))
+    all_values = set()
+    sample_files = mask_files[:min(50, len(mask_files))] 
+    for mask_file in sample_files:
+        mask = cv2.imread(os.path.join(mask_dir, mask_file), cv2.IMREAD_GRAYSCALE)
+        if mask is not None: 
+            all_values.update(np.unique(mask))
+    
+    # Hardcoded to 5 based on MSL dataset structure (0, 1, 2, 3, and 255/4)
+    num_classes = 5 
+    print(f"Unique raw mask values found in sample: {sorted(all_values)}")
+    print(f"NUM_CLASSES set to: {num_classes}")
+    return num_classes
+
+# Auto-adjust class names/count based on mask content (set to 5 for MSL)
+NUM_CLASSES = find_num_classes(MASK_DIR)
+if NUM_CLASSES < len(CLASS_NAMES):
+    CLASS_NAMES = CLASS_NAMES[:NUM_CLASSES]
+elif NUM_CLASSES > len(CLASS_NAMES):
+    # Dynamically add class names if more are found than expected
+    while len(CLASS_NAMES) < NUM_CLASSES:
+        CLASS_NAMES.append(f"Class {len(CLASS_NAMES)}")
+
+
+def load_and_preprocess_image(img_path):
+    """Loads, converts BGR->RGB, resizes, and normalizes image to [0, 1]."""
+    img = cv2.imread(img_path)
+    if img is None: return None
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # OpenCV reads BGR by default
+    img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
+    img = img / 255.0 # Normalize pixel values
+    return img.astype(np.float32)
+
+def load_and_preprocess_mask(mask_path):
+    """
+    Loads mask as grayscale, resizes using nearest neighbor (to preserve discrete labels),
+    and remaps the special value 255 (if present) to the last class index.
+    """
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None: return None
+    mask = cv2.resize(mask, (IMG_WIDTH, IMG_HEIGHT), interpolation=cv2.INTER_NEAREST)
+    if NUM_CLASSES == 5:
+        # Map the special 'ignore' value 255 to the 'No Label' class (index 4)
+        mask[mask == 255] = NUM_CLASSES - 1
+    mask = np.clip(mask, 0, NUM_CLASSES - 1) # Ensure values are within [0, 4]
+    return mask
+
+def load_dataset(img_dir, mask_dir):
+    """Loads all image-mask pairs using sorted filenames."""
+    img_files = sorted(os.listdir(img_dir))
+    mask_files = sorted(os.listdir(mask_dir))
+    X, Y = [], []
+    
+    print(f"Found {len(img_files)} image files")
+    print(f"Found {len(mask_files)} mask files")
+    
+    # Iterate through paired files
+    for img_name, mask_name in zip(img_files, mask_files):
+        img = load_and_preprocess_image(os.path.join(img_dir, img_name))
+        mask = load_and_preprocess_mask(os.path.join(mask_dir, mask_name))
+        if img is not None and mask is not None:
+            X.append(img)
+            Y.append(mask)
+    
+    print(f"Successfully loaded {len(X)} image-mask pairs")
+
+    Y_array = np.array(Y, dtype=np.int32)
+    # Add a channel dimension to masks: (N, H, W) -> (N, H, W, 1)
+    if Y_array.ndim == 3:
+        Y_array = np.expand_dims(Y_array, axis=-1)
+    return np.array(X, dtype=np.float32), Y_array
+
+
+print("\n--- Loading MSL MCAM Data ---")
+X_full, Y_full = load_dataset(IMG_DIR, MASK_DIR)
+
+# 3-way split: 70% train, 15% val, 15% test
+# 1. Split 15% for testing
+X_train_val, X_test, Y_train_val, Y_test = train_test_split(
+    X_full, Y_full, test_size=0.15, random_state=42
+)
+# 2. Split the remaining 85% into 70% train and 15% validation (~17.65% of 85%)
+X_train, X_val, Y_train, Y_val = train_test_split(
+    X_train_val, Y_train_val, test_size=0.1765, random_state=42 
+)
+
+# --- Data Split Summary ---
+N_TRAIN = X_train.shape[0]
+N_VALIDATION = X_val.shape[0]
+N_TEST = X_test.shape[0]
+
+print(f"\nDataset sizes:")
+print(f"  Training set (N_TRAIN): {N_TRAIN} samples")
+print(f"  Validation set (N_VALIDATION): {N_VALIDATION} samples")
+print(f"  Test set (N_TEST): {N_TEST} samples")
+
+# --------------------------
+# SECTION 2: RARE CLASS IDENTIFICATION
+# --------------------------
+print("\n" + "="*60)
+print("SECTION 2: RARE CLASS IDENTIFICATION")
+print("="*60)
+
+def identify_rare_images(Y_train_masks):
+    """
+    Calculates pixel distribution for each class in the training set.
+    Identifies classes below RARE_CLASS_THRESHOLD (5%) and finds the indices
+    of images containing these rare classes.
+    """
+    flat_masks = Y_train_masks.flatten()
+    total_pixels = flat_masks.size
+    # Count pixels per class
+    class_counts = np.bincount(flat_masks, minlength=NUM_CLASSES)
+    class_frequencies = class_counts / total_pixels
+    
+    print("\nClass Distribution (Training Set):")
+    for i, (count, freq) in enumerate(zip(class_counts, class_frequencies)):
+        print(f"  Class {i} ({CLASS_NAMES[i]}): {count:,} pixels ({freq*100:.2f}%)")
+    
+    # Identify rare classes
+    rare_classes = {i for i, freq in enumerate(class_frequencies) if freq < RARE_CLASS_THRESHOLD}
+    rare_image_indices = set()
+    
+    # Find images containing any rare class
+    for i in range(Y_train_masks.shape[0]):
+        if np.any(np.isin(Y_train_masks[i], list(rare_classes))):
+            rare_image_indices.add(i)
+            
+    print(f"\nRare Classes (< {RARE_CLASS_THRESHOLD*100:.1f}% frequency): {rare_classes}")
+    print(f"Images containing rare classes: {len(rare_image_indices)}/{len(Y_train_masks)}")
+    return rare_image_indices
+
+RARE_IMAGE_INDICES = identify_rare_images(Y_train)
+
+# --------------------------
+# SECTION 3: DATA AUGMENTATION (Rare Class Aware)
+# --------------------------
+print("\n" + "="*60)
+print("SECTION 3: DATA AUGMENTATION (Rare Class Aware)")
+print("="*60)
+
+class DataGenerator(keras.utils.Sequence):
+    """
+    Keras Sequence for efficient, multi-threaded batch generation.
+    It implements the rare-class-aware augmentation logic: higher probability (0.7) 
+    for images containing rare classes, lower (0.3) otherwise.
+    """
+    def __init__(self, X, Y, rare_indices, batch_size=BATCH_SIZE, augment=True, shuffle=True):
+        self.X = X
+        self.Y = Y
+        self.batch_size = batch_size
+        self.augment = augment
+        self.shuffle = shuffle
+        self.indices = np.arange(len(X))
+        self.rare_indices = rare_indices # Indices flagged for higher augmentation rate
+        self.on_epoch_end()
+
+    def __len__(self):
+        """Returns the number of batches per epoch."""
+        return int(np.floor(len(self.X) / self.batch_size))
+
+    def __getitem__(self, index):
+        """Generates one batch of data (images and one-hot masks)."""
+        start_idx = index * self.batch_size
+        end_idx = (index + 1) * self.batch_size
+        batch_indices = self.indices[start_idx:end_idx] 
+        # Create copies for augmentation
+        X_batch = self.X[batch_indices].copy()
+        Y_batch = self.Y[batch_indices].copy()
+
+        if self.augment:
+            X_batch, Y_batch = self._augment_batch(X_batch, Y_batch, batch_indices)
+
+        # Convert masks to one-hot encoding for the multi-class segmentation task
+        Y_batch_onehot = tf.keras.utils.to_categorical(Y_batch, num_classes=NUM_CLASSES)
+        return X_batch, Y_batch_onehot
+
+    def on_epoch_end(self):
+        """Shuffles indices at the end of each epoch if shuffling is enabled."""
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+    def _augment_batch(self, X_batch, Y_batch, batch_indices):
+        """Apply geometric and photometric augmentations, preserving mask alignment."""
+        X_aug, Y_aug = [], []
+        
+        for i, (img, mask) in enumerate(zip(X_batch, Y_batch)):
+            original_index_in_full_set = batch_indices[i] 
+            
+            # Set augmentation probability based on rarity flag
+            augment_prob = 0.7 if original_index_in_full_set in self.rare_indices else 0.3
+            
+            if np.random.rand() < augment_prob:
+                # 1. Horizontal flip
+                if np.random.rand() > 0.5:
+                    img = np.fliplr(img)
+                    mask = np.fliplr(mask)
+                # 2. Vertical flip
+                if np.random.rand() > 0.5:
+                    img = np.flipud(img)
+                    mask = np.flipud(mask)
+                # 3. Random 90-degree rotations (k=1, 2, or 3)
+                if np.random.rand() > 0.5:
+                    k = np.random.randint(1, 4)
+                    img = np.rot90(img, k)
+                    mask = np.rot90(mask, k)
+                # 4. Brightness adjustment (photometric)
+                if np.random.rand() > 0.5:
+                    factor = np.random.uniform(0.85, 1.15) # 15% change
+                    img = np.clip(img * factor, 0, 1) # Clip back to [0, 1]
+
+            X_aug.append(img)
+            Y_aug.append(mask)
+
+        return np.array(X_aug), np.array(Y_aug)
+
+
+print("Rare class-aware data generator created.")
+
+# --------------------------
+# SECTION 4: VGG16-BASED U-NET MODEL
+# --------------------------
+print("\n" + "="*60)
+print("SECTION 4: VGG16-BASED U-NET MODEL")
+print("="*60)
+
+def custom_vgg16_model(input_shape=(IMG_HEIGHT, IMG_WIDTH, CHANNELS)):
+    """
+    Loads VGG16 (pretrained on ImageNet) to serve as the U-Net Encoder.
+    It freezes the first two blocks and enables fine-tuning on Blocks 3, 4, and 5.
+    """
+    
+    vgg16 = VGG16(
+        include_top=False, # Don't include the final classification layer
+        input_shape=input_shape,
+        weights='imagenet' # Use pre-trained ImageNet weights
+    )
+    
+    # Set layers' trainability status
+    for layer in vgg16.layers:
+        # Keep early feature extraction layers frozen to preserve general features
+        if 'block1' in layer.name or 'block2' in layer.name:
+            layer.trainable = False
+        # Unfreeze deeper layers for task-specific fine-tuning
+        else:
+            layer.trainable = True
+
+    print(f"VGG16 loaded with ImageNet weights. Blocks 3, 4, and 5 are trainable.")
+    return vgg16
+
+
+def custom_UNet(base_model, num_classes=NUM_CLASSES):
+    """
+    Builds the U-Net decoder path using upsampling, concatenation with encoder skips,
+    and convolutional blocks (Conv2D + LeakyReLU + BatchNorm).
+    """
+    
+    # --- VGG16 Skip Connections (Encoder Outputs): ---
+    # These capture multi-scale features for the decoder to utilize.
+    skip1 = base_model.get_layer("block2_conv2").output  # Output from Block 2 (128x128)
+    skip2 = base_model.get_layer("block3_conv3").output  # Output from Block 3 (64x64)
+    skip3 = base_model.get_layer("block4_conv3").output  # Output from Block 4 (32x32)
+    skip4 = base_model.get_layer("block5_conv3").output  # Output from Block 5 (16x16)
+    
+    # Bottleneck (deepest feature map)
+    bottleneck = base_model.output # Output of the VGG16 (8x8)
+
+    # --- Decoder path (Upsampling) ---
+    
+    # Up1: 8x8 -> 16x16 (Connects to skip4)
+    up1 = UpSampling2D(size=(2, 2))(bottleneck)
+    up1 = Conv2D(512, (3, 3), padding='same')(up1)
+    up1 = LeakyReLU(0.1)(up1)
+    up1 = BatchNormalization()(up1)
+    concat_1 = concatenate([up1, skip4]) # Concatenate upsampled features with encoder skip
+    conv1 = Conv2D(512, (3, 3), padding='same')(concat_1)
+    conv1 = LeakyReLU(0.1)(conv1)
+    conv1 = BatchNormalization()(conv1)
+
+    # Up2: 16x16 -> 32x32 (Connects to skip3)
+    up2 = UpSampling2D(size=(2, 2))(conv1)
+    up2 = Conv2D(256, (3, 3), padding='same')(up2)
+    up2 = LeakyReLU(0.1)(up2)
+    up2 = BatchNormalization()(up2)
+    concat_2 = concatenate([up2, skip3]) 
+    conv2 = Conv2D(256, (3, 3), padding='same')(concat_2)
+    conv2 = LeakyReLU(0.1)(conv2)
+    conv2 = BatchNormalization()(conv2)
+
+    # Up3: 32x32 -> 64x64 (Connects to skip2)
+    up3 = UpSampling2D(size=(2, 2))(conv2)
+    up3 = Conv2D(128, (3, 3), padding='same')(up3)
+    up3 = LeakyReLU(0.1)(up3)
+    up3 = BatchNormalization()(up3)
+    concat_3 = concatenate([up3, skip2]) 
+    conv3 = Conv2D(128, (3, 3), padding='same')(concat_3)
+    conv3 = LeakyReLU(0.1)(conv3)
+    conv3 = BatchNormalization()(conv3)
+
+    # Up4: 64x64 -> 128x128 (Connects to skip1)
+    up4 = UpSampling2D(size=(2, 2))(conv3)
+    up4 = Conv2D(64, (3, 3), padding='same')(up4)
+    up4 = LeakyReLU(0.1)(up4)
+    up4 = BatchNormalization()(up4)
+    concat_4 = concatenate([up4, skip1]) 
+    conv4 = Conv2D(64, (3, 3), padding='same')(concat_4)
+    conv4 = LeakyReLU(0.1)(conv4)
+    conv4 = BatchNormalization()(conv4)
+
+    # Up5: 128x128 -> 256x256 (Final output resolution)
+    up5 = UpSampling2D(size=(2, 2))(conv4)
+    up5 = Conv2D(64, (3, 3), padding='same')(up5)
+    up5 = LeakyReLU(0.1)(up5)
+    up5 = BatchNormalization()(up5)
+    up5 = Dropout(0.12)(up5) # Regularization
+
+    # Final output layer: 1x1 convolution with softmax for multi-class prediction
+    outputs = Conv2D(num_classes, (1, 1), activation='softmax', padding='same', name='output')(up5)
+
+    final_model = Model(base_model.input, outputs, name=MODEL_NAME)
+
+    print(f"U-Net decoder built on VGG16")
+    return final_model
+
+
+# Build the model
+print("\n--- Building VGG16 U-Net Model ---")
+vgg16_base = custom_vgg16_model((IMG_HEIGHT, IMG_WIDTH, CHANNELS))
+model = custom_UNet(vgg16_base, num_classes=NUM_CLASSES)
+
+print(f"\nModel Summary:")
+print(f" Total parameters: {model.count_params():,}")
+print(f" Input shape: {model.input_shape}")
+print(f" Output shape: {model.output_shape}")
+
+
+# --------------------------
+# SECTION 5: PERFORMANCE METRICS & CUSTOM LOSS FUNCTIONS
+# --------------------------
+# The model uses a Hybrid Focal Dice Loss to handle class imbalance and overlap.
+print("\n" + "="*60)
+print("SECTION 5: PERFORMANCE METRICS & CUSTOM LOSS FUNCTIONS")
+print("="*60)
+
+# --- Metrics ---
+def dice_coefficient(y_true, y_pred, smooth=1e-6):
+    """Dice coefficient (F1-score) metric, robust for segmentation overlap."""
+    y_true_f = K.flatten(y_true)
+    y_pred_f = K.flatten(y_pred)
+    intersection = K.sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+
+def iou_metric(y_true, y_pred, smooth=1e-6):
+    """IoU (Intersection over Union) metric computed on soft predictions."""
+    intersection = K.sum(K.abs(y_true * y_pred))
+    union = K.sum(y_true) + K.sum(y_pred) - intersection
+    return (intersection + smooth) / (union + smooth)
+
+# Keras built-in MeanIoU for comprehensive multi-class evaluation
+mean_iou = tf.keras.metrics.MeanIoU(num_classes=NUM_CLASSES, name='mean_iou')
+
+
+# --- Loss Functions (Hybrid Focal Dice Loss) ---
+def DiceLoss(y_true, y_pred):
+    """Dice Loss: 1 - Dice Coefficient."""
+    return 1.0 - dice_coefficient(y_true, y_pred)
+
+
+def FocalLoss(y_true, y_pred, gamma=FOCAL_GAMMA, alpha=FOCAL_ALPHA):
+    """
+    Categorical Focal Loss: down-weights easy examples to focus training on hard examples.
+    (1 - p_t)^gamma is the modulating factor.
+    """
+    epsilon = K.epsilon()
+    y_pred = K.clip(y_pred, epsilon, 1.0 - epsilon)
+    
+    cross_entropy = -y_true * K.log(y_pred)
+    
+    # p_t: probability of the true class
+    p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+    mod_factor = K.pow(1.0 - p_t, gamma)
+    
+    focal_loss = mod_factor * cross_entropy
+    weighted_focal_loss = alpha * focal_loss
+    # Sum over classes and average over spatial/batch dimensions
+    return K.mean(K.sum(weighted_focal_loss, axis=-1))
+
+
+def HybridFocalDiceLoss(y_true, y_pred, focal_weight=0.5, dice_weight=0.5):
+    """Hybrid Loss: Weighted sum of Focal Loss and Dice Loss (0.5/0.5 split used here)."""
+    focal_l = FocalLoss(y_true, y_pred)
+    dice_l = DiceLoss(y_true, y_pred)
+    
+    return K.mean(focal_weight * focal_l + dice_weight * dice_l)
+
+
+# Compile model
+print(f"\n--- Compiling Model with {LOSS_FUNCTION_NAME} ---")
+model.compile(
+    optimizer=Adam(learning_rate=LEARNING_RATE),
+    loss=HybridFocalDiceLoss, # Use the custom hybrid loss function
+    metrics=['accuracy', dice_coefficient, iou_metric, mean_iou]
+)
+print(f"Model compiled with {LOSS_FUNCTION_NAME} and requested metrics for multi-class output")
+
+
+# --------------------------
+# SECTION 6: TRAINING
+# --------------------------
+print("\n" + "="*60)
+print("SECTION 6: TRAINING")
+print("="*60)
+
+# Create data generators using the 3-way split
+train_generator = DataGenerator(X_train, Y_train, RARE_IMAGE_INDICES, batch_size=BATCH_SIZE, augment=True, shuffle=True)
+val_generator = DataGenerator(X_val, Y_val, set(), batch_size=BATCH_SIZE, augment=False, shuffle=False)
+test_generator = DataGenerator(X_test, Y_test, set(), batch_size=BATCH_SIZE, augment=False, shuffle=False) 
+
+print(f"Training batches per epoch: {len(train_generator)}")
+print(f"Validation batches per epoch: {len(val_generator)}")
+print(f"Test batches: {len(test_generator)}")
+
+# ModelCheckpoint: Saves the model only when validation loss improves (min mode)
+checkpoint = ModelCheckpoint(
+    f'{MODEL_NAME}_best.h5', 
+    verbose=1, # Set to 1 to show when checkpoint saves
+    mode='min',
+    monitor='val_loss',
+    save_best_only=True
+)
+# EarlyStopping: Stops training if val_loss does not improve for PATIENCE epochs
+early_stopping = EarlyStopping(
+    monitor='val_loss',
+    patience=PATIENCE,
+    restore_best_weights=True, # Restore weights from the best epoch saved by checkpoint
+    verbose=1
+)
+
+# Train model
+print("\n--- Starting Training ---")
+history = model.fit(
+    train_generator,
+    validation_data=val_generator,
+    epochs=EPOCHS,
+    callbacks=[checkpoint, early_stopping],
+    verbose=1
+)
+
+print("\nTraining completed!")
+
+# Determine Early Stopping Info
+if early_stopping.stopped_epoch > 0:
+    actual_epochs_run = early_stopping.stopped_epoch
+    best_epoch = actual_epochs_run - PATIENCE # Best epoch is PATIENCE steps before stopping
+else:
+    actual_epochs_run = EPOCHS
+    best_epoch = EPOCHS
+
+
+# --------------------------
+# SECTION 7: FINAL RESULTS SUMMARY
+# --------------------------
+print("\n" + "="*60)
+print(f"## Final Results Summary for {MODEL_NAME}")
+print("="*60)
+
+# --- 1. Hyperparameter Table ---
+print("\n### Hyperparameters and Configuration")
+print(f"| Parameter | Value |")
+print(f"| :--- | :--- |")
+print(f"| **Model Architecture** | VGG16-based U-Net |")
+print(f"| **Image Size** | {IMG_HEIGHT}x{IMG_WIDTH} |")
+print(f"| **Optimizer** | {OPTIMIZER_NAME} |")
+print(f"| **Learning Rate** | {LEARNING_RATE} |")
+print(f"| **Loss Function** | {LOSS_FUNCTION_NAME} (0.5 Focal + 0.5 Dice) |")
+print(f"| **Batch Size** | {BATCH_SIZE} |")
+print(f"| **Max Epochs** | {EPOCHS} |")
+print(f"| **Early Stopping Patience** | {PATIENCE} (Monitor: val_loss) |")
+print(f"| **Rare Class Augmentation** | Enabled (Threshold {RARE_CLASS_THRESHOLD*100:.1f}%) |")
+
+
+# --- 2. Training & Stopping Info ---
+print("\n### Trial Summary")
+print(f"* **Model Name:** {MODEL_NAME}")
+print(f"* **Max Epochs:** {EPOCHS}")
+print(f"* **Actual Epochs Run:** {actual_epochs_run}")
+print(f"* **Early Stopping Occurred at:** Epoch {actual_epochs_run} (best model from Epoch {best_epoch})")
+print(f"* **Best Weights Restored From:** Epoch {best_epoch}")
+
+print("\n### Data and Masks Identified (MSL MCAM / AI4Mars)")
+print(f"* **Training Images (N_TRAIN):** {N_TRAIN}")
+print(f"* **Validation Images (N_VALIDATION):** {N_VALIDATION}")
+print(f"* **Testing Images (N_TEST):** {N_TEST}")
+print(f"* **Number of Masks Identified (NUM_CLASSES):** {NUM_CLASSES}")
+print(f"* **MSL Terrain Classes:** {', '.join(CLASS_NAMES)}")
+print(f"> *Reference: Masks refer to semantic segmentation for Mars rover traversability. Class 4, 'No Label (Rover/Null)', typically covers the rover itself and other masked-out regions.*")
+
+# --- 3. Results Per Epoch ---
+print("\n### Summary of All Epoch Trials")
+metrics_to_show = ['loss', 'val_loss', 'accuracy', 'val_accuracy', 'dice_coefficient', 'val_dice_coefficient', 'mean_iou', 'val_mean_iou']
+header = "Epoch | " + " | ".join(f"{m:^12.12}" for m in metrics_to_show)
+print("-" * (len(header) + 4))
+print(header)
+print("-" * (len(header) + 4))
+
+for epoch in range(len(history.history['loss'])):
+    # Mark the best epoch with an asterisk
+    best_epoch_flag = "*" if (epoch + 1 == best_epoch) else " "
+    values = [f"{history.history.get(m, [0])[epoch]:^12.4f}" for m in metrics_to_show]
+    print(f"{epoch + 1:^5}{best_epoch_flag}| " + " | ".join(values))
+print("-" * (len(header) + 4))
+
+
+# --- 4. Final Test Evaluation ---
+print("\n### Final Test Results (Best Model)")
+results = model.evaluate(test_generator, verbose=0) 
+metric_names = ['Loss', 'Accuracy', 'Dice Coefficient', 'IoU Metric', 'MeanIoU']
+
+for name, result in zip(metric_names, results):
+    print(f"Test {name:<20}: {result:.4f}")
+
+
+# --------------------------
+# SECTION 8: VISUALIZATION - TRAINING GRAPHS
+# --------------------------
+# Plots the training history for key metrics: Loss, Accuracy, Dice Coeff, and Mean IoU.
+print("\n" + "="*60)
+print("## VISUALIZATION - TRAINING GRAPHS")
+print("="*60)
+
+# Plot training history
+plt.figure(figsize=(20, 5))
+
+# 1. Loss Plot
+plt.subplot(1, 4, 1)
+plt.plot(history.history['loss'], label=f'Train {LOSS_FUNCTION_NAME}')
+plt.plot(history.history['val_loss'], label=f'Validation {LOSS_FUNCTION_NAME}') 
+plt.title(f'Loss vs. Epochs ({MODEL_NAME})')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+
+# 2. Accuracy Plot
+plt.subplot(1, 4, 2)
+plt.plot(history.history['accuracy'], label='Train Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy') 
+plt.title(f'Accuracy vs. Epochs ({MODEL_NAME})')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.grid(True)
+
+# 3. Dice Coefficient Plot
+plt.subplot(1, 4, 3)
+plt.plot(history.history['dice_coefficient'], label='Train Dice Coeff')
+plt.plot(history.history['val_dice_coefficient'], label='Validation Dice Coeff') 
+plt.title(f'Dice Coefficient vs. Epochs ({MODEL_NAME})')
+plt.xlabel('Epochs')
+plt.ylabel('Dice Coefficient')
+plt.legend()
+plt.grid(True)
+
+# 4. Mean IoU Plot
+plt.subplot(1, 4, 4)
+plt.plot(history.history['mean_iou'], label='Train Mean IoU')
+plt.plot(history.history['val_mean_iou'], label='Validation Mean IoU') 
+plt.title(f'Mean IoU vs. Epochs ({MODEL_NAME})')
+plt.xlabel('Epochs')
+plt.ylabel('Mean IoU')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+# Saving the file with model name
+PLOT_FILENAME = f'training_history_{MODEL_NAME}.png'
+plt.savefig(PLOT_FILENAME, dpi=300, bbox_inches='tight')
+print(f"\nTraining plots for {MODEL_NAME} saved as '{PLOT_FILENAME}' ")
+plt.show()
+
+
+# --------------------------
+# SECTION 9: VISUALIZATION - IMAGE PREDICTIONS
+# --------------------------
+# Displays sample results: Input Image, Predicted Mask, and Ground Truth Mask.
+print("\n" + "="*60)
+print("## VISUALIZATION - IMAGE PREDICTIONS")
+print("="*60)
+
+# --- Setup Custom Colormap and Normalization ---
+# Use a color map designed for categorical data
+cmap = plt.cm.get_cmap('jet', NUM_CLASSES)
+# Normalize ensures colors map correctly to the discrete class indices [0, 1, 2, 3, 4]
+norm = mcolors.BoundaryNorm(np.arange(-0.5, NUM_CLASSES, 1), cmap.N)
+
+# Select random test samples (up to 5)
+num_samples = min(5, len(X_test))
+indices = np.random.choice(len(X_test), num_samples, replace=False)
+
+# Create a figure grid for 3 columns (Image, Prediction, GT) and N rows
+fig, axes = plt.subplots(num_samples, 3, figsize=(15, num_samples * 3 + 1), 
+                         gridspec_kw={'wspace': 0.05, 'hspace': 0.1}) 
+
+if num_samples == 1:
+    axes = np.expand_dims(axes, axis=0)
+    
+fig.suptitle(f'Sample Predictions on Test Data - Model: {MODEL_NAME}', fontsize=16, y=0.98)
+
+for i, idx in enumerate(indices):
+    # Get image and ground truth from the Test Set
+    img = X_test[idx]
+    true_mask = Y_test[idx].squeeze()
+
+    # Predict mask for the sample image
+    pred_onehot = model.predict(img[np.newaxis, ...], verbose=0)[0] 
+    pred_mask = np.argmax(pred_onehot, axis=-1)
+
+    # Plot Input Image
+    ax = axes[i, 0]
+    ax.imshow(img)
+    if i == 0: ax.set_title('Input Image (RGB)')
+    ax.axis('off')
+
+    # Plot Predicted Mask
+    ax = axes[i, 1]
+    im = ax.imshow(pred_mask, cmap=cmap, norm=norm)
+    if i == 0: ax.set_title('Predicted Mask')
+    ax.axis('off')
+
+    # Plot Ground Truth
+    ax = axes[i, 2]
+    ax.imshow(true_mask, cmap=cmap, norm=norm)
+    if i == 0: ax.set_title('Ground Truth Mask')
+    ax.axis('off')
+
+# --- Add Colorbar Legend to the Figure ---
+# Create an axis dedicated to the colorbar
+cbar_ax = fig.add_axes([0.92, 0.1, 0.02, 0.8])
+
+cbar = fig.colorbar(im, cax=cbar_ax, ticks=np.arange(NUM_CLASSES))
+cbar.set_label('Terrain Class Index')
+
+cbar.ax.set_yticks(np.arange(NUM_CLASSES), minor=False)
+cbar.ax.set_yticklabels(CLASS_NAMES)
+cbar.set_label("MSL Terrain Class", fontsize=12)
+
+plt.tight_layout(rect=[0, 0, 0.9, 0.95]) # Adjust layout to make space for colorbar
+# Saving the file with model name
+PRED_FILENAME = f'predictions_on_test_set_{MODEL_NAME}.png'
+plt.savefig(PRED_FILENAME, dpi=300, bbox_inches='tight')
+print(f"Prediction samples for {MODEL_NAME} saved as '{PRED_FILENAME}' ")
+plt.show()
