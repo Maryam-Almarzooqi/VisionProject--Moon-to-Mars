@@ -10,7 +10,7 @@ Output: Multi-class semantic segmentation mask.
 Class imbalance handled via rare-class-aware augmentation.
 Loss: Hybrid Focal Dice Loss combining boundary sensitivity (Focal) with overlap optimization (Dice).
 
-##All of the codes are structured in the following Way:
+## All of the codes are structured in the following Way:
 
 Imports and Setup
 Configuration (Hyperparameters & Dataset Paths)
@@ -26,17 +26,17 @@ SECTION 9: Visualization – Image Predictions
 
 
 
-The different models we used are:
+## The different models we used are:
 
 
-LuSeg:
+### LuSeg:
 <img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/3bcb5a57-a77c-40e5-9649-72ef9889ada2" />
 
 The LuSeg_RGB model is a specialized Encoder-Decoder architecture, leveraging a pre-trained ResNet-50 as its feature-rich encoder, specifically designed for semantic segmentation of Mars rover images (MSL MCAM data). The input is a standard 3-channel RGB image. The encoder extracts features through four residual layers, followed by a U-Net style decoder that progressively upsamples these features. A critical component is the use of skip connections—where encoder outputs (e.g., skip_r_4, skip_r_3) are concatenated with the corresponding upsampled features in the decoder. This fusion, followed by a convolution block (decoder_catX), is crucial for combining deep semantic context with fine-grained spatial detail, allowing the model to accurately delineate terrain boundaries (Soil, Bedrock, Sand, Big Rock) for the planetary science application.
 
 
 
-VGG16:
+### VGG16:
 <img width="1024" height="448" alt="image" src="https://github.com/user-attachments/assets/7a46da95-e940-4545-b141-3ed7c299aa5e" />
 
 The VGG16-based U-Net is a semantic segmentation model that adapts the standard U-Net architecture for Mars Science Laboratory (MSL) images by employing the **VGG16** convolutional network as the powerful feature-extracting **encoder** (contracting path). This encoder, leveraging ImageNet pre-trained weights, extracts multi-scale features, while the first two blocks are frozen and the deeper blocks are fine-tuned for terrain classification. The **decoder** (expanding path) uses **UpSampling2D** and convolutional blocks combined with essential **skip connections**—which fuse high-resolution features from the encoder with upsampled decoder features—to accurately localize objects and preserve spatial details. The model handles the MSL dataset's class imbalance using a unique **rare-class-aware augmentation** strategy (prioritizing augmentation for images with rare terrain types) and is trained with a sophisticated **Hybrid Focal Dice Loss** (combining the boundary-focusing power of Focal Loss with the overlap-optimizing Dice Loss) to produce a five-class terrain segmentation mask.
@@ -44,7 +44,7 @@ The VGG16-based U-Net is a semantic segmentation model that adapts the standard 
 
 
 
-ResNet50:
+### ResNet50:
 
 <img width="1024" height="448" alt="image" src="https://github.com/user-attachments/assets/25cfdf3d-722d-489c-b6c7-b194c89fb316" />
 
@@ -52,7 +52,7 @@ ResNet50:
 The **ResNet50-based U-Net** is a deep semantic segmentation network customized for MSL (Mars Science Laboratory) images. It employs a **ResNet50** backbone as its **encoder** (contracting path), which is pre-trained on ImageNet. The earliest layers of the ResNet50 are frozen to maintain robust general feature extraction, while the later layers (the final `conv5_block` groups) are made **trainable** for domain-specific fine-tuning. The network's **decoder** (expanding path) uses standard U-Net operations: **UpSampling2D** and convolutional blocks (Conv2D, LeakyReLU, BatchNorm), connected via powerful **skip connections** to the corresponding encoder outputs (e.g., `conv1_relu`, `conv2_block3_out`, etc.). This structure efficiently captures both deep semantic information and high-resolution spatial details, culminating in a **Softmax** output layer for multi-class terrain prediction. The model is optimized for class imbalance using a **rare-class-aware augmentation** pipeline and the **Hybrid Focal Dice Loss**.
 
 
-DeepLabV3Plus:
+### DeepLabV3Plus:
 
 <img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/0588991b-ca6f-4935-bf92-73ec2ceb9e5c" />
 
@@ -61,7 +61,7 @@ The **DeepLabV3+** is a highly effective semantic segmentation architecture tail
 
 
 
-DenseNet:
+### DenseNet:
 
 <img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/6fb4a081-1cc5-42ac-9958-925e68797ad6" />
 
